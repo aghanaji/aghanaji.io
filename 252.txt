@@ -1,0 +1,188 @@
+import MetaTrader5 as mt5
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import time
+
+# User Configuration
+MAGIC_NUMBER = 20250406
+SYMBOL = "XAUUSD"
+TIMEFRAME = mt5.TIMEFRAME_M15
+
+class PropRules:
+    def __init__(self, initial_balance=5000):
+        self.INITIAL_BALANCE = initial_balance
+        self.DAILY_START_BALANCE = initial_balance
+        self.MAX_DAILY_LOSS_PERCENT = 0.05
+        self.MAX_TOTAL_LOSS_PERCENT = 0.12
+        self.last_day = None
+        self.account_failed = False
+        self.failure_date = None
+        self.failure_balance = None
+
+    def update_daily_balance(self, current_balance, current_time):
+        current_day = current_time.date()
+        if self.last_day != current_day:
+            self.DAILY_START_BALANCE = current_balance
+            self.last_day = current_day
+            return True
+        return False
+
+    def check_drawdown_rules(self, current_equity, current_time):
+        total_drawdown = (self.INITIAL_BALANCE - current_equity) / self.INITIAL_BALANCE * 100
+        total_loss_limit = self.INITIAL_BALANCE * (1 - self.MAX_TOTAL_LOSS_PERCENT)
+
+        if current_equity < total_loss_limit:
+            self.account_failed = True
+            self.failure_date = current_time
+            self.failure_balance = current_equity
+            return False, f"ACCOUNT FAILED: Total drawdown ({total_drawdown:.2f}%) exceeded"
+
+        daily_drawdown = (self.DAILY_START_BALANCE - current_equity) / self.DAILY_START_BALANCE * 100
+        daily_loss_limit = self.DAILY_START_BALANCE * (1 - self.MAX_DAILY_LOSS_PERCENT)
+
+        if current_equity < daily_loss_limit:
+            return False, f"DAILY TRADING STOPPED: Daily drawdown ({daily_drawdown:.2f}%) reached"
+
+        return True, "Trading allowed"
+
+def calculate_ema(data, period):
+    return pd.Series(data).ewm(span=period, adjust=False).mean()
+
+def calculate_atr(high, low, close, period=14):
+    tr = pd.DataFrame()
+    tr['h-l'] = high - low
+    tr['h-pc'] = abs(high - close.shift(1))
+    tr['l-pc'] = abs(low - close.shift(1))
+    tr['tr'] = tr[['h-l', 'h-pc', 'l-pc']].max(axis=1)
+    return tr['tr'].rolling(period).mean()
+
+def get_market_condition(ema_short, ema_long, close):
+    if close > ema_short and ema_short > ema_long:
+        return "STRONG_UPTREND"
+    elif close > ema_short and ema_short < ema_long:
+        return "WEAK_UPTREND"
+    elif close < ema_short and ema_short > ema_long:
+        return "WEAK_DOWNTREND"
+    else:
+        return "STRONG_DOWNTREND"
+
+def calculate_position_size(balance, risk_percent, entry_price, sl_price):
+    risk_money = balance * risk_percent
+    sl_distance_dollars = abs(entry_price - sl_price)
+    lot = round(risk_money / (sl_distance_dollars * 100), 2)
+    return min(lot, 5.0)
+
+def adjust_position_size(base_risk, market_condition, win_streak=0, balance=0, initial_balance=5000):
+    daily_drawdown = (initial_balance - balance) / initial_balance
+    if daily_drawdown > 0.015:
+        base_risk *= 0.25
+    elif daily_drawdown > 0.025:
+        base_risk *= 0.35
+
+    if market_condition in ["STRONG_UPTREND", "STRONG_DOWNTREND"]:
+        risk_multiplier = 1.05
+    else:
+        risk_multiplier = 0.65
+
+    streak_bonus = min(win_streak * 0.02, 0.08)
+
+    return min(base_risk * risk_multiplier * (1 + streak_bonus), 0.01)
+
+def run_live_trading(initial_balance=5000):
+    if not mt5.initialize():
+        print("MT5 initialization failed!", mt5.last_error())
+        return
+
+    print("Live Trading Started on", SYMBOL)
+
+    prop_rules = PropRules(initial_balance)
+    balance = initial_balance
+    current_position = None
+    win_streak = 0
+
+    while True:
+        now = datetime.now()
+        rates = mt5.copy_rates_from_pos(SYMBOL, TIMEFRAME, 0, 50)
+        df = pd.DataFrame(rates)
+        df['time'] = pd.to_datetime(df['time'], unit='s')
+        df.set_index('time', inplace=True)
+
+        df['ema_short'] = calculate_ema(df['close'], 8)
+        df['ema_long'] = calculate_ema(df['close'], 21)
+        df['atr'] = calculate_atr(df['high'], df['low'], df['close'], 14)
+
+        if len(df) < 22:
+            time.sleep(60)
+            continue
+
+        current = df.iloc[-1]
+        previous = df.iloc[-2]
+        prev2 = df.iloc[-3]
+
+        current_equity = balance  # TODO: optionally add floating pnl from open positions
+        prop_rules.update_daily_balance(balance, now)
+        can_trade, message = prop_rules.check_drawdown_rules(current_equity, now)
+
+        if prop_rules.account_failed:
+            print("Account Failed", message)
+            break
+
+        if not can_trade:
+            print("Trading paused:", message)
+            time.sleep(300)
+            continue
+
+        market_condition = get_market_condition(current['ema_short'], current['ema_long'], current['close'])
+
+        if current_position is None:
+            if prev2['close'] > prev2['open'] and previous['open'] > previous['close'] and "DOWNTREND" in market_condition:
+                entry_price = current['open']
+                sl_price = entry_price + current['atr'] * 1.5
+                risk_percent = adjust_position_size(0.01, market_condition, win_streak, balance)
+                lots = calculate_position_size(balance, risk_percent, entry_price, sl_price)
+                request = {
+                    "action": mt5.TRADE_ACTION_DEAL,
+                    "symbol": SYMBOL,
+                    "volume": lots,
+                    "type": mt5.ORDER_TYPE_SELL,
+                    "price": mt5.symbol_info_tick(SYMBOL).bid,
+                    "sl": sl_price,
+                    "magic": MAGIC_NUMBER,
+                    "deviation": 10,
+                    "type_filling": mt5.ORDER_FILLING_IOC,
+                    "comment": "Live SELL by bot"
+                }
+                result = mt5.order_send(request)
+                if result.retcode == mt5.TRADE_RETCODE_DONE:
+                    current_position = {"type": "SELL", "entry": entry_price, "lots": lots, "time": now}
+                    print("SELL order placed")
+
+            elif prev2['close'] < prev2['open'] and previous['open'] < previous['close'] and "UPTREND" in market_condition:
+                entry_price = current['open']
+                sl_price = entry_price - current['atr'] * 1.5
+                risk_percent = adjust_position_size(0.01, market_condition, win_streak, balance)
+                lots = calculate_position_size(balance, risk_percent, entry_price, sl_price)
+                request = {
+                    "action": mt5.TRADE_ACTION_DEAL,
+                    "symbol": SYMBOL,
+                    "volume": lots,
+                    "type": mt5.ORDER_TYPE_BUY,
+                    "price": mt5.symbol_info_tick(SYMBOL).ask,
+                    "sl": sl_price,
+                    "magic": MAGIC_NUMBER,
+                    "deviation": 10,
+                    "type_filling": mt5.ORDER_FILLING_IOC,
+                    "comment": "Live BUY by bot"
+                }
+                result = mt5.order_send(request)
+                if result.retcode == mt5.TRADE_RETCODE_DONE:
+                    current_position = {"type": "BUY", "entry": entry_price, "lots": lots, "time": now}
+                    print("BUY order placed")
+
+        time.sleep(60)
+
+    mt5.shutdown()
+
+if __name__ == "__main__":
+    run_live_trading()

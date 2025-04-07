@@ -1,0 +1,416 @@
+import MetaTrader5 as mt5
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import time
+
+# User Configuration
+USER_INFO = {
+    "login": "aghanaji",
+    "current_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+}
+MAGIC_NUMBER = 20250406
+SYMBOL = "XAUUSD"
+INITIAL_BALANCE = 5000
+
+class PropRules:
+    def __init__(self, initial_balance=5000):
+        self.INITIAL_BALANCE = initial_balance
+        self.DAILY_START_BALANCE = initial_balance
+        self.MAX_DAILY_LOSS_PERCENT = 0.05
+        self.MAX_TOTAL_LOSS_PERCENT = 0.12
+        self.last_day = None
+        self.account_failed = False
+        self.failure_date = None
+        self.failure_balance = None
+        
+    def update_daily_balance(self, current_balance, current_time):
+        current_day = current_time.date()
+        if self.last_day != current_day:
+            print(f"\nNew trading day: {current_day}")
+            print(f"Previous balance: ${self.DAILY_START_BALANCE:.2f}")
+            print(f"New daily start balance: ${current_balance:.2f}")
+            self.DAILY_START_BALANCE = current_balance
+            self.last_day = current_day
+            return True
+        return False
+        
+    def check_drawdown_rules(self, current_equity, current_time):
+        total_drawdown = (self.INITIAL_BALANCE - current_equity) / self.INITIAL_BALANCE * 100
+        total_loss_limit = self.INITIAL_BALANCE * (1 - self.MAX_TOTAL_LOSS_PERCENT)
+        
+        if current_equity < total_loss_limit:
+            self.account_failed = True
+            self.failure_date = current_time
+            self.failure_balance = current_equity
+            return False, f"ACCOUNT FAILED: Total drawdown ({total_drawdown:.2f}%) exceeded 12%"
+            
+        daily_drawdown = (self.DAILY_START_BALANCE - current_equity) / self.DAILY_START_BALANCE * 100
+        daily_loss_limit = self.DAILY_START_BALANCE * (1 - self.MAX_DAILY_LOSS_PERCENT)
+        
+        if current_equity < daily_loss_limit:
+            return False, f"DAILY TRADING STOPPED: Daily drawdown ({daily_drawdown:.2f}%) reached 5%"
+            
+        return True, "Trading allowed"
+
+def calculate_ema(data, period):
+    return pd.Series(data).ewm(span=period, adjust=False).mean()
+
+def calculate_atr(high, low, close, period=14):
+    tr = pd.DataFrame()
+    tr['h-l'] = high - low
+    tr['h-pc'] = abs(high - close.shift(1))
+    tr['l-pc'] = abs(low - close.shift(1))
+    tr['tr'] = tr[['h-l', 'h-pc', 'l-pc']].max(axis=1)
+    return tr['tr'].rolling(period).mean()
+
+def get_market_condition(ema_short, ema_long, close):
+    if close > ema_short and ema_short > ema_long:
+        return "STRONG_UPTREND"
+    elif close > ema_short and ema_short < ema_long:
+        return "WEAK_UPTREND"
+    elif close < ema_short and ema_short > ema_long:
+        return "WEAK_DOWNTREND"
+    else:
+        return "STRONG_DOWNTREND"
+
+def calculate_position_size(balance, risk_percent, entry_price, sl_price):
+    risk_money = balance * risk_percent
+    sl_distance_dollars = abs(entry_price - sl_price)
+    lot = round(risk_money / (sl_distance_dollars * 100), 2)
+    return min(lot, 5.0)
+
+def adjust_position_size(base_risk, market_condition, win_streak=0, balance=0, initial_balance=5000):
+    daily_drawdown = (initial_balance - balance) / initial_balance
+    
+    if daily_drawdown > 0.015:
+        base_risk *= 0.25
+    elif daily_drawdown > 0.025:
+        base_risk *= 0.35
+        
+    if market_condition in ["STRONG_UPTREND", "STRONG_DOWNTREND"]:
+        risk_multiplier = 1.05
+    else:
+        risk_multiplier = 0.65
+        
+    streak_bonus = min(win_streak * 0.02, 0.08)
+    
+    return min(base_risk * risk_multiplier * (1 + streak_bonus), 0.01)
+
+def get_last_trades(symbol, magic_number, count=10):
+    """Get the last trades for the specified symbol and magic number"""
+    from_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    positions_history = mt5.history_deals_get(from_date, datetime.now())
+    
+    if positions_history is None or len(positions_history) == 0:
+        return []
+    
+    trades = []
+    for deal in positions_history:
+        if deal.symbol == symbol and deal.magic == magic_number:
+            trades.append({
+                'time': deal.time_msc,
+                'type': 'BUY' if deal.type == mt5.DEAL_TYPE_BUY else 'SELL',
+                'price': deal.price,
+                'profit': deal.profit,
+                'volume': deal.volume
+            })
+    
+    return trades[-count:] if len(trades) > count else trades
+
+def get_ha_data(symbol, timeframe, num_candles=100):
+    """Get Heikin-Ashi candle data for analysis"""
+    rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, num_candles)
+    if rates is None:
+        print("Error: Could not get historical data")
+        return None
+        
+    df = pd.DataFrame(rates)
+    df['time'] = pd.to_datetime(df['time'], unit='s')
+    
+    df.set_index('time', inplace=True)
+    df = df.resample('18T').agg({
+        'open': 'first',
+        'high': 'max',
+        'low': 'min',
+        'close': 'last',
+        'tick_volume': 'sum',
+        'spread': 'last',
+        'real_volume': 'sum'
+    }).dropna()
+    df.reset_index(inplace=True)
+    
+    df['ema_short'] = calculate_ema(df['close'], 8)
+    df['ema_long'] = calculate_ema(df['close'], 21)
+    df['atr'] = calculate_atr(df['high'], df['low'], df['close'], 14)
+    
+    ha_data = []
+    for i in range(len(df)):
+        if i == 0:
+            ha_close = (df['open'].iloc[i] + df['high'].iloc[i] + 
+                      df['low'].iloc[i] + df['close'].iloc[i]) / 4
+            ha_open = (df['open'].iloc[i] + df['close'].iloc[i]) / 2
+        else:
+            ha_close = (df['open'].iloc[i] + df['high'].iloc[i] + 
+                      df['low'].iloc[i] + df['close'].iloc[i]) / 4
+            ha_open = (ha_data[-1]['open'] + ha_data[-1]['close']) / 2
+            
+        ha_data.append({
+            'time': df['time'].iloc[i],
+            'open': ha_open,
+            'close': ha_close,
+            'high': max(df['high'].iloc[i], ha_open, ha_close),
+            'low': min(df['low'].iloc[i], ha_open, ha_close),
+            'ema_short': df['ema_short'].iloc[i],
+            'ema_long': df['ema_long'].iloc[i],
+            'atr': df['atr'].iloc[i]
+        })
+    
+    return ha_data
+
+def close_position(symbol, position_type):
+    """Close an open position of specified type"""
+    positions = mt5.positions_get(symbol=symbol)
+    
+    if positions is None:
+        print("No positions to close")
+        return False
+    
+    for position in positions:
+        if (position_type == "BUY" and position.type == mt5.POSITION_TYPE_BUY) or \
+           (position_type == "SELL" and position.type == mt5.POSITION_TYPE_SELL):
+            # Prepare the request
+            if position.type == mt5.POSITION_TYPE_BUY:
+                price = mt5.symbol_info_tick(symbol).bid
+                trade_type = mt5.ORDER_TYPE_SELL
+            else:
+                price = mt5.symbol_info_tick(symbol).ask
+                trade_type = mt5.ORDER_TYPE_BUY
+                
+            request = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "symbol": symbol,
+                "volume": position.volume,
+                "type": trade_type,
+                "position": position.ticket,
+                "price": price,
+                "magic": MAGIC_NUMBER,
+                "comment": "PROP_CLOSE",
+                "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": mt5.ORDER_FILLING_IOC,
+            }
+            
+            # Send order
+            result = mt5.order_send(request)
+            if result.retcode != mt5.TRADE_RETCODE_DONE:
+                print(f"Close position failed, retcode = {result.retcode}")
+                return False
+            
+            print(f"Position closed: {position.ticket}")
+            return True
+    
+    return False
+
+def open_trade(symbol, order_type, lot_size, price, sl_price, comment=""):
+    """Open a new trade"""
+    if order_type == "BUY":
+        trade_type = mt5.ORDER_TYPE_BUY
+        price = mt5.symbol_info_tick(symbol).ask
+    else:
+        trade_type = mt5.ORDER_TYPE_SELL
+        price = mt5.symbol_info_tick(symbol).bid
+    
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "volume": lot_size,
+        "type": trade_type,
+        "price": price,
+        "sl": sl_price,
+        "magic": MAGIC_NUMBER,
+        "comment": comment,
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+    
+    result = mt5.order_send(request)
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        print(f"Order failed, retcode = {result.retcode}")
+        return False
+    
+    print(f"Order succeeded: {order_type} {lot_size} lots at {price}, SL: {sl_price}")
+    return True
+
+def has_open_position(symbol):
+    """Check if there's an open position for the symbol"""
+    positions = mt5.positions_get(symbol=symbol)
+    return positions is not None and len(positions) > 0
+
+def get_account_info():
+    """Get current account balance and equity"""
+    account_info = mt5.account_info()
+    if account_info is None:
+        print("Failed to get account info")
+        return None, None
+    
+    return account_info.balance, account_info.equity
+
+def run_prop_trader(symbol=SYMBOL, initial_balance=INITIAL_BALANCE):
+    """Main function to run the PROP trading strategy"""
+    print(f"\nStarting Enhanced PROP Strategy Trading")
+    print(f"Current Time (UTC): {datetime.now()}")
+    print(f"User: {USER_INFO['login']}")
+    print(f"Initial Balance: ${initial_balance}")
+    print("-" * 50)
+
+    # Initialize PropRules
+    prop_rules = PropRules(initial_balance)
+    win_streak = 0
+    
+    # Get account balance for initial setup
+    balance, equity = get_account_info()
+    if balance is None:
+        print("Cannot get account information. Exiting.")
+        return
+    
+    if prop_rules.last_day is None:
+        prop_rules.last_day = datetime.now().date()
+        prop_rules.update_daily_balance(balance, datetime.now())
+    
+    while True:
+        try:
+            current_time = datetime.now()
+            
+            # Get latest data for analysis
+            ha_data = get_ha_data(symbol, mt5.TIMEFRAME_M15, 50)
+            if ha_data is None or len(ha_data) < 21:
+                print("Insufficient data for analysis. Waiting...")
+                time.sleep(300)  # Wait 5 minutes
+                continue
+            
+            balance, equity = get_account_info()
+            
+            # Check prop rules
+            prop_rules.update_daily_balance(balance, current_time)
+            can_trade, message = prop_rules.check_drawdown_rules(equity, current_time)
+            
+            if prop_rules.account_failed:
+                print("\n" + "!" * 50)
+                print("ACCOUNT FAILED!")
+                print(f"Date: {prop_rules.failure_date}")
+                print(f"Final Balance: ${prop_rules.failure_balance:.2f}")
+                print(f"Total Loss: ${initial_balance - prop_rules.failure_balance:.2f}")
+                print(f"Total Drawdown: {((initial_balance - prop_rules.failure_balance)/initial_balance)*100:.2f}%")
+                print("!" * 50 + "\n")
+                break
+            
+            if not can_trade:
+                print(f"\n{message}")
+                # If daily trading is stopped, close all positions
+                if "DAILY" in message:
+                    print("Closing all positions due to daily drawdown limit")
+                    close_position(symbol, "BUY")
+                    close_position(symbol, "SELL")
+                    time.sleep(3600)  # Wait 1 hour before checking again
+                    continue
+            
+            # Get market condition from the most recent candle
+            i = len(ha_data) - 1
+            market_condition = get_market_condition(
+                ha_data[i]['ema_short'],
+                ha_data[i]['ema_long'],
+                ha_data[i]['close']
+            )
+            
+            # Check if we have an open position
+            has_position = has_open_position(symbol)
+            
+            if has_position:
+                # Check if it's time to close (current candle has opposite direction)
+                positions = mt5.positions_get(symbol=symbol)
+                
+                for position in positions:
+                    position_type = "BUY" if position.type == mt5.POSITION_TYPE_BUY else "SELL"
+                    
+                    if ((position_type == 'SELL' and ha_data[i]['close'] > ha_data[i]['open']) or
+                        (position_type == 'BUY' and ha_data[i]['close'] < ha_data[i]['open'])):
+                        
+                        print(f"Signal to close {position_type} position detected")
+                        if close_position(symbol, position_type):
+                            # Get profit information for win streak tracking
+                            last_trades = get_last_trades(symbol, MAGIC_NUMBER, 1)
+                            if last_trades and last_trades[-1]['profit'] > 0:
+                                win_streak += 1
+                            else:
+                                win_streak = 0
+            
+            elif i >= 2 and can_trade:
+                # Check for entry signals
+                if (ha_data[i-2]['close'] > ha_data[i-2]['open'] and
+                    ha_data[i-1]['open'] > ha_data[i-1]['close'] and
+                    "DOWNTREND" in market_condition):
+                    
+                    entry_price = ha_data[i]['open']
+                    sl_distance = ha_data[i]['atr'] * 1.5
+                    sl_price = entry_price + sl_distance
+                    
+                    risk_percent = adjust_position_size(
+                        0.01,
+                        market_condition,
+                        win_streak,
+                        balance,
+                        initial_balance
+                    )
+                    
+                    lot = calculate_position_size(balance, risk_percent, entry_price, sl_price)
+                    
+                    print(f"SELL Signal detected at {current_time}")
+                    print(f"Entry: {entry_price}, SL: {sl_price}, Lots: {lot}")
+                    open_trade(symbol, "SELL", lot, entry_price, sl_price, "PROP_SELL")
+                
+                elif (ha_data[i-2]['close'] < ha_data[i-2]['open'] and
+                      ha_data[i-1]['open'] < ha_data[i-1]['close'] and
+                      "UPTREND" in market_condition):
+                    
+                    entry_price = ha_data[i]['open']
+                    sl_distance = ha_data[i]['atr'] * 1.5
+                    sl_price = entry_price - sl_distance
+                    
+                    risk_percent = adjust_position_size(
+                        0.01,
+                        market_condition,
+                        win_streak,
+                        balance,
+                        initial_balance
+                    )
+                    
+                    lot = calculate_position_size(balance, risk_percent, entry_price, sl_price)
+                    
+                    print(f"BUY Signal detected at {current_time}")
+                    print(f"Entry: {entry_price}, SL: {sl_price}, Lots: {lot}")
+                    open_trade(symbol, "BUY", lot, entry_price, sl_price, "PROP_BUY")
+            
+            # Print current status
+            print(f"\nStatus at {current_time}:")
+            print(f"Market Condition: {market_condition}")
+            print(f"Balance: ${balance:.2f}, Equity: ${equity:.2f}")
+            print(f"Win Streak: {win_streak}")
+            
+            # Wait for next cycle - check every 18 minutes (matching the timeframe)
+            time.sleep(1080)
+            
+        except Exception as e:
+            print(f"Error during trading: {e}")
+            time.sleep(300)  # Wait 5 minutes if error occurs
+
+if __name__ == "__main__":
+    print(f"Initializing PROP Trading Strategy...")
+    
+    if not mt5.initialize():
+        print("MT5 initialization failed!")
+        print(f"Error: {mt5.last_error()}")
+        exit()
+    
+    run_prop_trader(symbol=SYMBOL, initial_balance=INITIAL_BALANCE)
+    
+    mt5.shutdown()
